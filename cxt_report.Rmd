@@ -1,0 +1,263 @@
+---
+title: "Trading Strategies"
+author: "Jun Yitt"
+date: "November 1, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load R Packages and the Data Set
+```{r message=F, warning=F}
+library(lubridate)
+library(plotly)
+library(dplyr)
+library(fpp)
+library(quantmod)
+library(xts)
+library(TTR)
+library(PerformanceAnalytics)
+
+setwd("C:/Users/jy/Desktop/cxt")
+df <- read.csv("Data Set.csv", stringsAsFactors = F)
+```
+
+##Pre-processing of Data 
+```{r message=F, warning=F}
+#Convert OHLC,V to numeric variables
+for(i in c(2,3,4,5,6)){
+      df[,i] <- as.numeric(df[,i])
+}
+
+#Convert string to date
+df[,1] <- ymd(df[,1])
+
+summary(df)
+```
+
+There are extreme values and NA value in the data set. Those values should be excluded.
+
+```{r}
+u1 <- abs(df[,2]) < 1000
+df <- df[u1,]
+
+df <- df[complete.cases(df),]
+
+summary(df)
+```
+
+## Candlestick Plot of the Asset Price
+```{r plot1, echo=T, message=F, warning=F}
+bbands <- BBands(df[,c("H","L","C")])
+df <- cbind(df, data.frame(bbands[,1:3]))
+# plot candlestick chart
+p <- df %>%
+  plot_ly(x = ~Date, type="candlestick",
+          open = ~O, close = ~C,
+          high = ~H, low = ~L, name = "Price") %>%
+add_lines(y = ~up , name = "B Bands",
+            line = list(color = '#ccc', width = 0.5),
+            legendgroup = "Bollinger Bands",
+            hoverinfo = "none") %>%
+  add_lines(y = ~dn, name = "B Bands",
+            line = list(color = '#ccc', width = 0.5),
+            legendgroup = "Bollinger Bands",
+            showlegend = FALSE, hoverinfo = "none") %>%
+  add_lines(y = ~mavg, name = "Mv Avg",
+            line = list(color = '#E377C2', width = 0.5),
+            hoverinfo = "none") %>%
+  layout(yaxis = list(title = "Price"))
+
+
+# plot volume bar chart
+pp <- df %>%
+  plot_ly(x=~Date, y=~V, type='bar', name = "Volume") %>%
+  layout(yaxis = list(title = "Volume"))
+
+# create rangeselector buttons
+rs <- list(visible = TRUE, x = 0.5, y = -0.055,
+           xanchor = 'center', yref = 'paper',
+           font = list(size = 9),
+           buttons = list(
+             list(count=1,
+                  label='RESET',
+                  step='all'),
+             list(count=1,
+                  label='1 YR',
+                  step='year',
+                  stepmode='backward'),
+             list(count=3,
+                  label='3 MO',
+                  step='month',
+                  stepmode='backward'),
+             list(count=1,
+                  label='1 MO',
+                  step='month',
+                  stepmode='backward')
+           ))
+
+# subplot with shared x axis
+p <- subplot(p, pp, heights = c(0.7,0.2), nrows=2,
+             shareX = TRUE, titleY = TRUE) %>%
+  layout(title = paste("price"),
+         xaxis = list(rangeselector = rs),
+         legend = list(orientation = 'h', x = 0.5, y = 1,
+                       xanchor = 'center', yref = 'paper',
+                       font = list(size = 10),
+                       bgcolor = 'transparent'))
+
+p
+
+```
+
+
+We can't possible know the High and Low of an intraday price movement without looking into the future. Therefore, we can exclude these 2 columns.
+```{r}
+df2 <- df[,c("Date", "O", "C", "V")]
+n <- nrow(df2)
+df2$return <- ( df2[1:n,"C"]/c(NA, df2[1:(n-1), "C"]) ) - 1  #Today's close divided by yesterday's close
+df2$closedivopen <- ( df2[1:n,"C"]/df2[1:n,"O"] ) - 1 #Today's close divided by today's open
+
+summary(df2)
+```
+
+##Plot of Daily Returns
+```{r}
+plot(x = df2$Date, y = df2$return)
+```
+
+There are volatility clustering near the end of 2008, which gives the clue that this time series resembles a stock price series during the subprime crisis. A strong uptrend follows after the crisis.  
+*Since this series isn't "forged", I doubt there are any "obvious" opportunity or anomaly to capture.  
+
+##Ideas
+Most stock prices trend upwards, and when there is an uptrend, there is strong positive autocorrelation between today's and yesterday's price.    
+
+###Strategy 1 (an uptrend momentum based approach):
+Personally, I don't prefer an intraday strategy (trading on noises are difficult especially with transaction cost). A weekly trading strategy is used, where:
+1. Convert daily returns to weekly returns
+2. If previous week return > a certain percentage, then buy at the opening of the start of this week. Sell at the end of this week.
+3. If previous week return < a certain percentage, do nothing this week. *Based on the belief that stock prices tend to trend upwards, and downward movements are difficult to predict. Therefore, only buy and do not short sell.
+4. Repeat.
+
+###Backtesting
+For simplicity, we assume 0% round trip cost, and we do not hold the stock even though next week gives a buy signal. We will sell and rebuy again on such circumstances.
+We will backtest Strategy 1 with 2 different parameters, one is to set "a certain percentage" as 0% and 2nd as 2%.
+
+```{r}
+wkret <- function(cl, op){
+      L <- length(cl)
+      cl[L]/op[1]-1
+}
+wkclose <- function(v){
+      L <- length(v)
+      v[L]
+}
+signal <- function(wkreturn, percent = 0 ){
+      wkreturn > percent
+}
+
+roundtripcost <- 0.000 #Assume 0% round trip cost 
+df4 <- as.data.frame( df2 %>% 
+                            mutate(yr = year(Date), wk = week(Date)) %>% 
+                            group_by(yr, wk) %>% 
+                            summarise(Date = Date[length(Date)], wkreturn = wkret(C, O), wkclose = wkclose(C)) 
+                      )
+df5 <- df4 %>%   mutate(signal = lag(signal(wkreturn, 0), 1) ) %>%
+          mutate(signal2 = lag(signal(wkreturn, 0.02), 1) ) %>%
+          mutate(adj_wkreturn = wkreturn - roundtripcost) #adjust for round trip cost
+
+                  
+actual <- xts(df5$adj_wkreturn, df5$Date); 
+signal_1 <- xts(df5$adj_wkreturn*df5$signal, df5$Date)
+signal_2 <- xts(df5$adj_wkreturn*df5$signal2, df5$Date)
+
+compare <- na.omit(cbind(actual, signal_1, signal_2))
+colnames(compare) <- c("Actual", "Signal 1", "Signal 2")
+charts.PerformanceSummary(compare)
+
+```
+
+```{r}
+nostrat <- prod(1+df5$adj_wkreturn, na.rm = T) - 1
+strat1a <- prod(1+df5$adj_wkreturn*df5$signal, na.rm = T) - 1 
+strat1b <- prod(1+df5$adj_wkreturn*df5$signal2, na.rm = T) -1
+```
+
+Without implementing any strategy (just buy at the start of week and sell at the end of week), the total return is `r nostrat`; Strategy 1 (0%) return: `r strat1a`; Strategy 1 (2%) return: `r strat1b`. In other words, Strategy 1 is a losing strategy. 
+
+###Strategy 2 (a "regression to mean" based approach):
+The first strategy is bad in this scenario, what if we revert the "criteria". The justification now is such that, stock price that drops, tends to rebound and revert back to the "mean" trend. *It's bad to do curve fitting, but for now, we just try to have a look at what results this strategy would give.
+
+1. Convert daily returns to weekly returns.     
+2. If previous week return < a certain percentage, then buy at the opening of the start of this week. Sell at the end of this week.    
+3. If previous week return > a certain percentage, do nothing this week. *Based on the belief that stock prices tend to trend upwards, and downward movements are difficult to predict. Therefore, only buy and do not short sell.    
+4. Repeat.    
+
+```{r}
+wkret <- function(cl, op){
+      L <- length(cl)
+      cl[L]/op[1]-1
+}
+wkclose <- function(v){
+      L <- length(v)
+      v[L]
+}
+signal <- function(wkreturn, percent = 0 ){
+      wkreturn < percent
+}
+
+roundtripcost <- 0.000 #Assume 0% round trip cost 
+df4 <- as.data.frame( df2 %>% 
+                            mutate(yr = year(Date), wk = week(Date)) %>% 
+                            group_by(yr, wk) %>% 
+                            summarise(Date = Date[length(Date)], wkreturn = wkret(C, O), wkclose = wkclose(C)) 
+                      )
+df5 <- df4 %>%   mutate(signal = lag(signal(wkreturn, 0), 1) ) %>%
+          mutate(signal2 = lag(signal(wkreturn, 0.02), 1) ) %>%
+          mutate(adj_wkreturn = wkreturn - roundtripcost) #adjust for round trip cost
+
+                  
+actual <- xts(df5$adj_wkreturn, df5$Date); 
+signal_1 <- xts(df5$adj_wkreturn*df5$signal, df5$Date)
+signal_2 <- xts(df5$adj_wkreturn*df5$signal2, df5$Date)
+
+compare <- na.omit(cbind(actual, signal_1, signal_2))
+colnames(compare) <- c("Actual", "Signal 1", "Signal 2")
+charts.PerformanceSummary(compare)
+
+```
+
+```{r}
+nostrat <- prod(1+df5$adj_wkreturn, na.rm = T) - 1
+strat2a <- prod(1+df5$adj_wkreturn*df5$signal, na.rm = T) - 1 
+strat2b <- prod(1+df5$adj_wkreturn*df5$signal2, na.rm = T) - 1
+```
+
+Without implementing any strategy (just buy at the start of week and sell at the end of week), the total return is `r nostrat`; Strategy 1 (0%) return: `r strat2a`; Strategy 1 (2%) return: `r strat2b`. In other words, Strategy 2 is quite a winning strategy. 
+
+##Looking Back at ACF & PACF
+**After I did Strategy 1, I realised I could just look at the ACF and PACF plot of the weekly returns. Based on these 2 plots, Strategy 2 should be suggested first, because the weekly returns are actually more negatively autocorrelated than positively autocorrelated.
+
+```{r}
+tsdisplay(actual)
+```
+
+
+##Round Trip Cost
+```{r}
+num_of_trades <- sum(df5$signal2, na.rm = T)
+
+breakeven_roundtripcost <- strat2b/num_of_trades
+
+```
+
+The number of trades done using Strategy 2 (2%) is `r num_of_trades`. For simplicity, assume the breakeven round trip cost is the total return generated divided by the number of trades.  
+Hence, the breakeven round trip cost is `r breakeven_roundtripcost`.
+
+
+##Conclusion
+Strategy 1 resembles more of a qualitative approach, but it fails in this specific case, I believe it would work on a general stock market.    
+Strategy 2 resembles more of a statistical approach, where we try to exploit  negative autocorrelation in the weekly returns, but this may fail if such autocorrelation disappears due to other external factors (fundamental reasons/changes in the economic environment).  
+
